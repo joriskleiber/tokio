@@ -205,6 +205,7 @@ impl<T: fmt::Debug> fmt::Debug for Shared<T> {
 pub mod error {
     //! Watch error types.
 
+    use std::error::Error;
     use std::fmt;
 
     /// Error produced when sending a value fails.
@@ -225,7 +226,7 @@ pub mod error {
         }
     }
 
-    impl<T> std::error::Error for SendError<T> {}
+    impl<T> Error for SendError<T> {}
 
     /// Error produced when receiving a change notification.
     #[derive(Debug, Clone)]
@@ -239,7 +240,7 @@ pub mod error {
         }
     }
 
-    impl std::error::Error for RecvError {}
+    impl Error for RecvError {}
 }
 
 mod big_notify {
@@ -740,6 +741,8 @@ async fn changed_impl<T>(
     shared: &Shared<T>,
     version: &mut Version,
 ) -> Result<(), error::RecvError> {
+    crate::trace::async_trace_leaf().await;
+
     loop {
         // In order to avoid a race condition, we first request a notification,
         // **then** check the current value's version. If a new version exists,
@@ -1038,6 +1041,8 @@ impl<T> Sender<T> {
     /// }
     /// ```
     pub async fn closed(&self) {
+        crate::trace::async_trace_leaf().await;
+
         while self.receiver_count() > 0 {
             let notified = self.shared.notify_tx.notified();
 

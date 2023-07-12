@@ -1,5 +1,7 @@
 use crate::loom::sync::Arc;
-use crate::runtime::scheduler::current_thread;
+use crate::runtime::context;
+use crate::runtime::scheduler::{self, current_thread, Inject};
+
 use backtrace::BacktraceFrame;
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -59,6 +61,11 @@ pin_project_lite::pin_project! {
     }
 }
 
+const FAIL_NO_THREAD_LOCAL: &str = "The Tokio thread-local has been destroyed \
+                                    as part of shutting down the current \
+                                    thread, so collecting a taskdump is not \
+                                    possible.";
+
 impl Context {
     pub(crate) const fn new() -> Self {
         Context {
@@ -69,7 +76,7 @@ impl Context {
 
     /// SAFETY: Callers of this function must ensure that trace frames always
     /// form a valid linked list.
-    unsafe fn with_current<F, R>(f: F) -> R
+    unsafe fn try_with_current<F, R>(f: F) -> Option<R>
     where
         F: FnOnce(&Self) -> R,
     {
@@ -80,14 +87,18 @@ impl Context {
     where
         F: FnOnce(&Cell<Option<NonNull<Frame>>>) -> R,
     {
-        Self::with_current(|context| f(&context.active_frame))
+        Self::try_with_current(|context| f(&context.active_frame)).expect(FAIL_NO_THREAD_LOCAL)
     }
 
     fn with_current_collector<F, R>(f: F) -> R
     where
         F: FnOnce(&Cell<Option<Trace>>) -> R,
     {
-        unsafe { Self::with_current(|context| f(&context.collector)) }
+        // SAFETY: This call can only access the collector field, so it cannot
+        // break the trace frame linked list.
+        unsafe {
+            Self::try_with_current(|context| f(&context.collector)).expect(FAIL_NO_THREAD_LOCAL)
+        }
     }
 }
 
@@ -131,7 +142,7 @@ impl Trace {
 pub(crate) fn trace_leaf(cx: &mut task::Context<'_>) -> Poll<()> {
     // Safety: We don't manipulate the current context's active frame.
     let did_trace = unsafe {
-        Context::with_current(|context_cell| {
+        Context::try_with_current(|context_cell| {
             if let Some(mut collector) = context_cell.collector.take() {
                 let mut frames = vec![];
                 let mut above_leaf = false;
@@ -163,15 +174,21 @@ pub(crate) fn trace_leaf(cx: &mut task::Context<'_>) -> Poll<()> {
                 false
             }
         })
+        .unwrap_or(false)
     };
 
     if did_trace {
         // Use the same logic that `yield_now` uses to send out wakeups after
         // the task yields.
-        let defer = crate::runtime::context::with_defer(|rt| {
-            rt.defer(cx.waker());
+        context::with_scheduler(|scheduler| {
+            if let Some(scheduler) = scheduler {
+                match scheduler {
+                    scheduler::Context::CurrentThread(s) => s.defer.defer(cx.waker()),
+                    #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
+                    scheduler::Context::MultiThread(s) => s.defer.defer(cx.waker()),
+                }
+            }
         });
-        debug_assert!(defer.is_some());
 
         Poll::Pending
     } else {
@@ -236,11 +253,14 @@ impl<T: Future> Future for Root<T> {
 pub(in crate::runtime) fn trace_current_thread(
     owned: &OwnedTasks<Arc<current_thread::Handle>>,
     local: &mut VecDeque<Notified<Arc<current_thread::Handle>>>,
-    injection: &mut VecDeque<Notified<Arc<current_thread::Handle>>>,
+    injection: &Inject<Arc<current_thread::Handle>>,
 ) -> Vec<Trace> {
     // clear the local and injection queues
     local.clear();
-    injection.clear();
+
+    while let Some(task) = injection.pop() {
+        drop(task);
+    }
 
     // notify each task
     let mut tasks = vec![];
@@ -258,4 +278,53 @@ pub(in crate::runtime) fn trace_current_thread(
             trace
         })
         .collect()
+}
+
+cfg_rt_multi_thread! {
+    use crate::loom::sync::Mutex;
+    use crate::runtime::scheduler::multi_thread;
+    use crate::runtime::scheduler::multi_thread::Synced;
+    use crate::runtime::scheduler::inject::Shared;
+
+    /// Trace and poll all tasks of the current_thread runtime.
+    ///
+    /// ## Safety
+    ///
+    /// Must be called with the same `synced` that `injection` was created with.
+    pub(in crate::runtime) unsafe fn trace_multi_thread(
+        owned: &OwnedTasks<Arc<multi_thread::Handle>>,
+        local: &mut multi_thread::queue::Local<Arc<multi_thread::Handle>>,
+        synced: &Mutex<Synced>,
+        injection: &Shared<Arc<multi_thread::Handle>>,
+    ) -> Vec<Trace> {
+        // clear the local queue
+        while let Some(notified) = local.pop() {
+            drop(notified);
+        }
+
+        // clear the injection queue
+        let mut synced = synced.lock();
+        while let Some(notified) = injection.pop(&mut synced.inject) {
+            drop(notified);
+        }
+
+        drop(synced);
+
+        // notify each task
+        let mut traces = vec![];
+        owned.for_each(|task| {
+            // set the notified bit
+            task.as_raw().state().transition_to_notified_for_tracing();
+
+            // trace the task
+            let ((), trace) = Trace::capture(|| task.as_raw().poll());
+            traces.push(trace);
+
+            // reschedule the task
+            let _ = task.as_raw().state().transition_to_notified_by_ref();
+            task.as_raw().schedule();
+        });
+
+        traces
+    }
 }

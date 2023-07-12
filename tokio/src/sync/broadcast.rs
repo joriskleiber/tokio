@@ -501,7 +501,8 @@ impl<T> Sender<T> {
     ///
     /// On success, the number of subscribed [`Receiver`] handles is returned.
     /// This does not mean that this number of receivers will see the message as
-    /// a receiver may drop before receiving the message.
+    /// a receiver may drop or lag ([see lagging](self#lagging)) before receiving
+    /// the message.
     ///
     /// # Note
     ///
@@ -1279,6 +1280,8 @@ where
     type Output = Result<T, RecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
+        ready!(crate::trace::trace_leaf(cx));
+
         let (receiver, waiter) = self.project();
 
         let guard = match receiver.recv_ref(Some((waiter, cx.waker()))) {
